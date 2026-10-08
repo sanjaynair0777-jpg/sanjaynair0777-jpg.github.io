@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ISS Live Tracker</title>
+
+<!-- Leaflet: the free map library -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<!-- MapLibre GL + its Leaflet plugin: draws OpenFreeMap's vector tiles inside Leaflet.
+     Order matters: Leaflet first, then MapLibre, then the plugin. -->
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@2.2.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@2.2.1/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.20/leaflet-maplibre-gl.js"></script>
+
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #map { position: absolute; inset: 0; }
+
+  /* Floating info panel */
+  #panel {
+    position: absolute; top: 12px; right: 12px; z-index: 1000;
+    width: 240px; padding: 14px 16px;
+    background: rgba(15, 23, 42, 0.92); color: #e2e8f0;
+    border-radius: 10px; font-size: 14px; line-height: 1.6;
+  }
+  #panel h1 { margin: 0 0 8px; font-size: 16px; }
+  #panel dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
+  #panel dt { color: #94a3b8; }
+  #panel dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+  #status { margin-top: 8px; font-size: 12px; color: #94a3b8; }
+  #status.error { color: #fca5a5; }
+  label { display: block; margin-top: 8px; font-size: 13px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="panel">
+  <h1>ISS live tracker</h1>
+  <dl>
+    <dt>Latitude</dt>       <dd id="lat">–</dd>
+    <dt>Longitude</dt>      <dd id="lon">–</dd>
+    <dt>Altitude</dt>       <dd id="alt">–</dd>
+    <dt>Speed</dt>          <dd id="speed">–</dd>
+    <dt id="homeLabel">From Edinburgh</dt> <dd id="dist">–</dd>
+  </dl>
+  <label><input type="checkbox" id="follow" checked> Follow the ISS</label>
+  <button id="locate">Use my location</button>
+  <div id="status">Loading…</div>
+</div>
+
+<script>
+// ---------- 1. Settings ----------
+const API_URL = "https://api.wheretheiss.at/v1/satellites/25544"; // 25544 = ISS
+const REFRESH_MS = 5000;               // update every 5 seconds
+const MAX_TRAIL_POINTS = 60;           // ~5 minutes of trail
+let HOME = { name: "Edinburgh", lat: 55.9533, lon: -3.1883 };
+
+// ---------- 2. Set up the map ----------
+const map = L.map("map", { worldCopyJump: true }).setView([20, 0], 3);
+
+// OpenFreeMap: free, no API key. Other styles: "positron" (minimal), "bright".
+L.maplibreGL({
+  style: "https://tiles.openfreemap.org/styles/liberty",
+  attribution: '<a href="https://openfreemap.org" target="_blank">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/" target="_blank">OpenMapTiles</a> Data from <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a>'
+}).addTo(map);
+
+// A simple emoji marker so we don't need any image files
+const issIcon = L.divIcon({
+  html: "🛰️",
+  className: "",
+  iconSize: [32, 32],
+  iconAnchor: [16, 16]
+});
+const issMarker = L.marker([0, 0], { icon: issIcon }).addTo(map);
+
+// Mark your home city too
+const homeMarker = L.circleMarker([HOME.lat, HOME.lon], { radius: 6, color: "#2563eb" })
+  .addTo(map)
+  .bindTooltip(HOME.name);
+
+// ---------- 3. The trail ----------
+// The trail is a list of "segments". When the ISS crosses the edge of the map
+// (longitude jumps from ~180 to ~-180) we start a new segment so no line
+// gets drawn across the whole world.
+let segments = [[]];
+let trailLines = [];
+
+function addToTrail(lat, lon) {
+  const current = segments[segments.length - 1];
+  const last = current[current.length - 1];
+  if (last && Math.abs(lon - last[1]) > 180) {
+    segments.push([]);
+  }
+  segments[segments.length - 1].push([lat, lon]);
+
+  // Keep the trail short
+  let total = segments.reduce((n, s) => n + s.length, 0);
+  while (total > MAX_TRAIL_POINTS) {
+    segments[0].shift();
+    if (segments[0].length === 0 && segments.length > 1) segments.shift();
+    total--;
+  }
+
+  // Redraw
+  trailLines.forEach(line => line.remove());
+  trailLines = segments.map(seg =>
+    L.polyline(seg, { color: "#4c1d95", weight: 3, opacity: 0.8 }).addTo(map)
+  );
+}
+
+// ---------- 4. Haversine: distance between two points on Earth ----------
+function distanceKm(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Earth's radius in km
+  const toRad = deg => deg * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// ---------- 5. Fetch + update ----------
+const $ = id => document.getElementById(id);
+
+async function updateISS() {
+  try {
+    const response = await fetch(API_URL);
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const data = await response.json();
+
+    const { latitude, longitude, altitude, velocity } = data;
+
+    // Move the marker and extend the trail
+    issMarker.setLatLng([latitude, longitude]);
+    addToTrail(latitude, longitude);
+    if ($("follow").checked) map.panTo([latitude, longitude]);
+
+    // Update the panel
+    $("lat").textContent = latitude.toFixed(2) + "°";
+    $("lon").textContent = longitude.toFixed(2) + "°";
+    $("alt").textContent = Math.round(altitude).toLocaleString() + " km";
+    $("speed").textContent = Math.round(velocity).toLocaleString() + " km/h";
+    $("dist").textContent =
+      Math.round(distanceKm(HOME.lat, HOME.lon, latitude, longitude)).toLocaleString() + " km";
+
+    $("status").className = "";
+    $("status").textContent = "Updated " + new Date().toLocaleTimeString();
+  } catch (err) {
+    $("status").className = "error";
+    $("status").textContent = "Couldn't reach the ISS data. Retrying…";
+    console.error(err);
+  }
+}
+
+updateISS();                         // run once straight away
+setInterval(updateISS, REFRESH_MS);  // then repeat on a timer
+
+$("locate").addEventListener("click", () => {
+  if (!navigator.geolocation) {
+    $("status").textContent = "Your browser doesn't support location.";
+    return;
+  }
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      HOME = { name: "You", lat: pos.coords.latitude, lon: pos.coords.longitude };
+      homeMarker.setLatLng([HOME.lat, HOME.lon]).setTooltipContent("You");
+      $("homeLabel").textContent = "From you";
+      updateISS(); // refresh the distance straight away
+    },
+    () => {
+      $("status").className = "error";
+      $("status").textContent = "Location blocked. Allow it in your browser to use this.";
+    }
+  );
+});
+
+</script>
+</body>
+</html>
